@@ -6,7 +6,9 @@
       "Bash(gh api:*)",
       "Bash(npx bmad-method:*)",
       "Bash(gh auth:*)",
-      "Bash(git init:*)"
+      "Bash(git init:*)",
+      "WebSearch",
+      "WebFetch(domain:vite.dev)"
     ]
   }
 }
