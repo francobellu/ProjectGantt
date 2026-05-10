@@ -1,14 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npx skills:*)",
-      "Bash(gh repo:*)",
-      "Bash(gh api:*)",
-      "Bash(npx bmad-method:*)",
-      "Bash(gh auth:*)",
-      "Bash(git init:*)",
-      "WebSearch",
-      "WebFetch(domain:vite.dev)"
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(git checkout *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5173/ProjectGantt/)",
+      "Bash(git add *)"
     ]
   }
 }
