@@ -18,8 +18,7 @@ export function ImportPanel() {
     setBusy(true)
     setStatus('')
     try {
-      const text = await file.text()
-      const raw = JSON.parse(text)
+      const raw = await file.text()
       const { scrs, huats, errors } = parseJiraExport(raw)
       if (scrs.length === 0 && huats.length === 0) {
         setStatus(`No SCR or HUAT tickets found. Errors: ${errors.join('; ')}`)
@@ -91,7 +90,7 @@ export function ImportPanel() {
   }
 
   const steps: { id: ImportStep; label: string; accept: string; handler: (f: File) => void }[] = [
-    { id: 'jira', label: 'Step 1 — Jira JSON export', accept: '.json', handler: handleJiraFile },
+    { id: 'jira', label: 'Step 1 — Jira XML export', accept: '.xml', handler: handleJiraFile },
     { id: 'qg-dates', label: 'Step 2 — QG Dates (Excel)', accept: '.xlsx,.xls', handler: handleQGDatesFile },
     { id: 'qg-requirements', label: 'Step 3 — QG Requirements (Excel)', accept: '.xlsx,.xls', handler: handleQGRequirementsFile },
   ]

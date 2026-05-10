@@ -1,56 +1,4 @@
-import { z } from 'zod'
 import type { SCR, HUAT } from '../../shared/db/schema'
-
-// Jira JSON export schema (fields that matter to us)
-const JiraIssueSchema = z.object({
-  key: z.string(),
-  fields: z.object({
-    summary: z.string(),
-    status: z.object({ name: z.string() }),
-    assignee: z.object({ displayName: z.string() }).nullable().optional(),
-    priority: z.object({ name: z.string() }).nullable().optional(),
-    components: z.array(z.object({ name: z.string() })).optional().default([]),
-    labels: z.array(z.string()).optional().default([]),
-    issuetype: z.object({ name: z.string() }),
-    // Custom field for target release — name may differ per org
-    fixVersions: z.array(z.object({ name: z.string() })).optional().default([]),
-    duedate: z.string().nullable().optional(),
-    // Sprint / start date as custom fields (optional, org-dependent)
-    customfield_10020: z.unknown().optional(), // sprint
-    customfield_10015: z.string().nullable().optional(), // start date
-    issuelinks: z.array(z.object({
-      type: z.object({ outward: z.string() }),
-      outwardIssue: z.object({ key: z.string() }).optional(),
-      inwardIssue: z.object({ key: z.string() }).optional(),
-    })).optional().default([]),
-  }),
-})
-
-const JiraExportSchema = z.object({
-  issues: z.array(JiraIssueSchema),
-})
-
-type JiraIssue = z.infer<typeof JiraIssueSchema>
-
-function extractRelease(issue: JiraIssue): string | null {
-  return issue.fields.fixVersions?.[0]?.name ?? null
-}
-
-function extractStartDate(issue: JiraIssue): string | null {
-  return issue.fields.customfield_10015 ?? null
-}
-
-function extractBlockingHUATs(issue: JiraIssue): string[] {
-  return (issue.fields.issuelinks ?? [])
-    .filter((l) => l.type.outward === 'is blocked by' && l.inwardIssue)
-    .map((l) => l.inwardIssue!.key)
-}
-
-function extractBlockedSCRs(issue: JiraIssue): string[] {
-  return (issue.fields.issuelinks ?? [])
-    .filter((l) => l.type.outward === 'blocks' && l.outwardIssue)
-    .map((l) => l.outwardIssue!.key)
-}
 
 export interface ParseResult {
   scrs: SCR[]
@@ -58,10 +6,23 @@ export interface ParseResult {
   errors: string[]
 }
 
-export function parseJiraExport(raw: unknown): ParseResult {
-  const result = JiraExportSchema.safeParse(raw)
-  if (!result.success) {
-    return { scrs: [], huats: [], errors: [result.error.message] }
+/**
+ * Parse a Jira XML export (RSS format from Filters → Export → XML).
+ * Uses the browser's built-in DOMParser.
+ */
+export function parseJiraExport(xmlText: string): ParseResult {
+  const parser = new DOMParser()
+  const doc = parser.parseFromString(xmlText, 'text/xml')
+
+  // Check for parse errors
+  const parseError = doc.querySelector('parsererror')
+  if (parseError) {
+    return { scrs: [], huats: [], errors: [`XML parse error: ${parseError.textContent}`] }
+  }
+
+  const items = doc.querySelectorAll('rss > channel > item')
+  if (items.length === 0) {
+    return { scrs: [], huats: [], errors: ['No <item> elements found in XML. Is this a Jira RSS export?'] }
   }
 
   const scrs: SCR[] = []
@@ -69,42 +30,100 @@ export function parseJiraExport(raw: unknown): ParseResult {
   const errors: string[] = []
   const now = new Date().toISOString()
 
-  for (const issue of result.data.issues) {
-    const issueType = issue.fields.issuetype.name.toLowerCase()
-    const isSCR = issueType.includes('scr') || issue.key.startsWith('SCR-')
-    const isHUAT = issueType.includes('huat') || issueType.includes('defect')
+  for (const item of items) {
+    const key = text(item, 'key')
+    if (!key) {
+      errors.push('Skipped item with no key')
+      continue
+    }
+
+    const type = text(item, 'type')
+    const summary = text(item, 'summary') ?? text(item, 'title')?.replace(/^\[.+\]\s*/, '') ?? ''
+    const status = text(item, 'status') ?? 'Unknown'
+    const assignee = attr(item, 'assignee', 'username') ?? text(item, 'assignee')
+    // For fixVersion, Jira RSS uses <version> or <fixVersion>
+    const targetRelease = text(item, 'fixVersion') ?? text(item, 'version')
+    const dueDate = text(item, 'duedate')
+    const createdAt = text(item, 'created')?.split(' ')[0] ?? null
+    const priority = text(item, 'priority')
+
+    // Components: multiple <component> elements
+    const components = Array.from(item.querySelectorAll(':scope > component'))
+      .map((e) => e.textContent?.trim() ?? '')
+      .filter(Boolean)
+
+    // Labels: <labels><label>...</label></labels>
+    const labels = Array.from(item.querySelectorAll(':scope > labels > label'))
+      .map((e) => e.textContent?.trim() ?? '')
+      .filter(Boolean)
+
+    // Issue links: <issuelinks><issuelinktype>...</issuelinktype></issuelinks>
+    const blockingHUATs: string[] = []
+    const blockedSCRs: string[] = []
+    const issuelinks = item.querySelector(':scope > issuelinks')
+    if (issuelinks) {
+      const linkTypes = issuelinks.querySelectorAll(':scope > issuelinktype')
+      for (const lt of linkTypes) {
+        const linkName = text(lt, 'name') ?? ''
+        const isBlockedBy = linkName.toLowerCase().includes('blocks')
+        const blocks = isBlockedBy && !linkName.toLowerCase().includes('blocked by')
+        const outwardLinks = lt.querySelectorAll(':scope > outwardlinks > issuelink > issuekey')
+        for (const ik of outwardLinks) {
+          const linkedKey = ik.textContent?.trim() ?? ''
+          if (linkedKey) {
+            if (isBlockedBy && !blocks) blockingHUATs.push(linkedKey)
+            else if (blocks) blockedSCRs.push(linkedKey)
+          }
+        }
+      }
+    }
+
+    const isSCR = type?.toLowerCase().includes('scr') || key.startsWith('SCR-')
+    const isHUAT = type?.toLowerCase().includes('huat') || type?.toLowerCase().includes('defect')
 
     if (isSCR) {
       scrs.push({
-        id: issue.key,
-        summary: issue.fields.summary,
-        status: issue.fields.status.name,
-        assignee: issue.fields.assignee?.displayName ?? null,
-        targetRelease: extractRelease(issue),
-        startDate: extractStartDate(issue),
-        dueDate: issue.fields.duedate ?? null,
-        priority: issue.fields.priority?.name ?? null,
-        components: issue.fields.components?.map((c) => c.name) ?? [],
-        labels: issue.fields.labels ?? [],
-        huatBlockers: extractBlockingHUATs(issue),
+        id: key,
+        summary,
+        status,
+        assignee: assignee ?? null,
+        targetRelease: targetRelease ?? null,
+        startDate: createdAt,
+        dueDate: dueDate ?? null,
+        priority: priority ?? null,
+        components,
+        labels,
+        huatBlockers: blockingHUATs,
         importedAt: now,
       })
     } else if (isHUAT) {
       huats.push({
-        id: issue.key,
-        summary: issue.fields.summary,
-        status: issue.fields.status.name,
-        assignee: issue.fields.assignee?.displayName ?? null,
-        targetRelease: extractRelease(issue),
-        startDate: extractStartDate(issue),
-        dueDate: issue.fields.duedate ?? null,
-        blocksScrs: extractBlockedSCRs(issue),
+        id: key,
+        summary,
+        status,
+        assignee: assignee ?? null,
+        targetRelease: targetRelease ?? null,
+        startDate: createdAt,
+        dueDate: dueDate ?? null,
+        blocksScrs: blockedSCRs,
         importedAt: now,
       })
     } else {
-      errors.push(`Skipped issue ${issue.key} (type: ${issue.fields.issuetype.name})`)
+      errors.push(`Skipped issue ${key} (type: ${type ?? 'unknown'})`)
     }
   }
 
   return { scrs, huats, errors }
+}
+
+/** Get text content of a direct child element, or null if missing. */
+function text(parent: Element, tagName: string): string | null {
+  const el = parent.querySelector(`:scope > ${tagName}`)
+  return el?.textContent?.trim() ?? null
+}
+
+/** Get an attribute value of a direct child element, or null if missing. */
+function attr(parent: Element, tagName: string, attrName: string): string | null {
+  const el = parent.querySelector(`:scope > ${tagName}`)
+  return el?.getAttribute(attrName) ?? null
 }
